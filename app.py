@@ -10,8 +10,51 @@ from urllib.parse import urljoin, urlparse
 import time
 from queue import Queue
 
+import weaviate
+from weaviate import WeaviateClient
+from weaviate.connect import ConnectionParams
+from transformers import AutoTokenizer, AutoModel
+import torch
+
 app = Flask(__name__)
 progress_queue = Queue()  # Add this line
+
+connection_params = ConnectionParams.from_url(
+    url="http://localhost:8080",
+    grpc_port=8081
+)
+client = WeaviateClient(connection_params)
+
+try:
+    # Create WebPage collection if it doesn't exist
+    collection = client.collections.create(
+        name="WebPage",
+        description="A scraped webpage",
+        vectorizer_config=None,  # We'll provide vectors manually
+        properties=[
+            {
+                "name": "url",
+                "data_type": "string"
+            },
+            {
+                "name": "content",
+                "data_type": "text"
+            }
+        ]
+    )
+except Exception as e:
+    print("Error creating Weaviate collection:", e)
+
+embedding_model_name = "Alibaba-NLP/gte-Qwen2-7B-instruct"
+tokenizer = AutoTokenizer.from_pretrained(embedding_model_name)
+model = AutoModel.from_pretrained(embedding_model_name)
+
+def generate_embedding(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    embedding = outputs.last_hidden_state.mean(dim=1)
+    return embedding.squeeze(0).tolist()
 
 class WebCrawler:
     def __init__(self, base_url, output_dir="crawled_data"):
@@ -89,7 +132,6 @@ class WebCrawler:
         return f"{filename}.md"
 
     async def crawl_page(self, url):
-        """Crawl a single page and save its markdown content"""
         try:
             # Check if page already exists
             filename = self.sanitize_filename(url)
@@ -106,16 +148,23 @@ class WebCrawler:
                 )
                 
                 # Add metadata at the top of the file
-                metadata = f"""---
-url: {url}
-title: {result.title if hasattr(result, 'title') else 'Untitled'}
-date_crawled: {result.timestamp if hasattr(result, 'timestamp') else ''}
----
-
-"""
+                metadata = f"""---\nurl: {url}\ntitle: {result.title if hasattr(result, 'title') else 'Untitled'}\ndate_crawled: {result.timestamp if hasattr(result, 'timestamp') else ''}\n---\n\n"""
+                content = metadata + result.markdown
                 
                 with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(metadata + result.markdown)
+                    f.write(content)
+                
+                # Generate embedding for the content
+                try:
+                    embedding = generate_embedding(content)
+                    # Insert the webpage into Weaviate using the v4 method
+                    client.data.create(
+                        data_object={"url": url, "content": content},
+                        class_name="WebPage",
+                        vector=embedding
+                    )
+                except Exception as e:
+                    print(f"Error inserting into Weaviate for {url}: {e}")
                 
                 return filepath
         except Exception as e:
